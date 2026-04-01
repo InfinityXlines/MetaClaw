@@ -21,7 +21,10 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]  # torch optional in skills_only mode
 
 logger = logging.getLogger(__name__)
 

@@ -616,6 +616,7 @@ class MetaClawAPIServer:
         async def chat_completions(
             request: Request,
             authorization: Optional[str] = Header(default=None),
+            x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
             x_session_id: Optional[str] = Header(default=None),
             x_turn_type: Optional[str] = Header(default=None),
             x_session_done: Optional[str] = Header(default=None),
@@ -627,7 +628,7 @@ class MetaClawAPIServer:
             # Update idle tracker so the scheduler knows the user is active
             if owner._last_request_tracker is not None:
                 owner._last_request_tracker.touch()
-            await owner._check_auth(authorization)
+            await owner._check_auth(authorization, x_api_key)
             if not owner.submission_enabled.is_set():
                 # Queue requests while submission is paused instead of returning 503.
                 # Use a bounded wait so clients don't hang forever on abnormal stalls.
@@ -688,6 +689,7 @@ class MetaClawAPIServer:
                 session_done=session_done,
                 memory_scope=memory_scope,
                 upstream_authorization=authorization if owner.config.llm_auth_passthrough else None,
+                upstream_x_api_key=x_api_key if owner.config.llm_auth_passthrough else None,
             )
             if stream:
                 return StreamingResponse(
@@ -702,6 +704,7 @@ class MetaClawAPIServer:
         async def anthropic_messages(
             request: Request,
             authorization: Optional[str] = Header(default=None),
+            x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
             x_session_id: Optional[str] = Header(default=None),
             x_turn_type: Optional[str] = Header(default=None),
             x_session_done: Optional[str] = Header(default=None),
@@ -714,11 +717,12 @@ class MetaClawAPIServer:
 
             This enables Hermes (which uses the Anthropic SDK natively) to
             talk to MetaClaw without changing its api_mode.
+            Accepts auth via Authorization: Bearer or x-api-key header.
             """
             owner: MetaClawAPIServer = request.app.state.owner
             if owner._last_request_tracker is not None:
                 owner._last_request_tracker.touch()
-            await owner._check_auth(authorization)
+            await owner._check_auth(authorization, x_api_key)
 
             body = await request.json()
 
@@ -855,6 +859,7 @@ class MetaClawAPIServer:
                 session_done=session_done,
                 memory_scope=memory_scope,
                 upstream_authorization=authorization if owner.config.llm_auth_passthrough else None,
+                upstream_x_api_key=x_api_key if owner.config.llm_auth_passthrough else None,
             )
 
             # The response from _handle_request is in OpenAI format.
@@ -1127,11 +1132,15 @@ class MetaClawAPIServer:
 
         return app
 
-    async def _check_auth(self, authorization: Optional[str]):
+    async def _check_auth(self, authorization: Optional[str], x_api_key: Optional[str] = None):
         # In passthrough mode, skip local validation — let upstream validate.
-        # We still require *some* token so the proxy isn't wide-open.
+        # Accept either Authorization: Bearer or x-api-key (Anthropic-style).
         if self.config.llm_auth_passthrough:
-            if not authorization or not authorization.startswith("Bearer "):
+            has_auth = (
+                (authorization and authorization.startswith("Bearer "))
+                or bool(x_api_key)
+            )
+            if not has_auth:
                 raise HTTPException(status_code=401, detail="missing bearer token")
             return
         if not self._expected_api_key:
@@ -1329,6 +1338,7 @@ class MetaClawAPIServer:
         session_done: bool,
         memory_scope: str = "",
         upstream_authorization: Optional[str] = None,
+        upstream_x_api_key: Optional[str] = None,
     ) -> dict[str, Any]:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -1420,7 +1430,7 @@ class MetaClawAPIServer:
         forward_body["messages"] = _ensure_reasoning_content(messages)
 
         if self.config.mode == "skills_only":
-            output = await self._forward_to_llm(forward_body, upstream_authorization=upstream_authorization)
+            output = await self._forward_to_llm(forward_body, upstream_authorization=upstream_authorization, upstream_x_api_key=upstream_x_api_key)
         else:
             output = await self._forward_to_tinker(forward_body)
 
@@ -1741,13 +1751,13 @@ class MetaClawAPIServer:
     # LLM forwarding (skills_only mode)                                   #
     # ------------------------------------------------------------------ #
 
-    async def _forward_to_llm(self, body: dict[str, Any], upstream_authorization: Optional[str] = None) -> dict[str, Any]:
+    async def _forward_to_llm(self, body: dict[str, Any], upstream_authorization: Optional[str] = None, upstream_x_api_key: Optional[str] = None) -> dict[str, Any]:
         """Forward to a real LLM API (skills_only mode).
 
         Supports both OpenAI-compatible (/v1/chat/completions) and
         Anthropic-native (/v1/messages) upstream formats.  When
         ``config.llm_auth_passthrough`` is True, the incoming Authorization
-        header is forwarded to upstream instead of using ``llm_api_key``.
+        or x-api-key header is forwarded to upstream instead of using ``llm_api_key``.
         """
         import httpx
 
@@ -1760,9 +1770,13 @@ class MetaClawAPIServer:
 
         # --- Build auth header ---
         headers: dict[str, str] = {}
-        if self.config.llm_auth_passthrough and upstream_authorization:
-            # Pass through the client's auth (OAuth token from Hermes)
-            headers["Authorization"] = upstream_authorization
+        if self.config.llm_auth_passthrough:
+            if upstream_authorization:
+                # Pass through the client's Bearer token (OAuth from Hermes/Claude CLI)
+                headers["Authorization"] = upstream_authorization
+            if upstream_x_api_key:
+                # Pass through Anthropic-style x-api-key (from OpenClaw)
+                headers["x-api-key"] = upstream_x_api_key
         elif self.config.llm_api_key:
             headers["Authorization"] = f"Bearer {self.config.llm_api_key}"
 
