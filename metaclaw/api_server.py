@@ -695,6 +695,183 @@ class MetaClawAPIServer:
                 )
             return JSONResponse(content=result["response"])
 
+        # -------------------------------------------------------------- #
+        # Anthropic Messages API endpoint (for Hermes integration)       #
+        # -------------------------------------------------------------- #
+        @app.post("/v1/messages")
+        async def anthropic_messages(
+            request: Request,
+            authorization: Optional[str] = Header(default=None),
+            x_session_id: Optional[str] = Header(default=None),
+            x_turn_type: Optional[str] = Header(default=None),
+            x_session_done: Optional[str] = Header(default=None),
+            x_memory_scope: Optional[str] = Header(default=None),
+            x_user_id: Optional[str] = Header(default=None),
+            x_workspace_id: Optional[str] = Header(default=None),
+        ):
+            """Accept Anthropic Messages API format, translate to internal
+            OpenAI format for skill/memory injection, then forward upstream.
+
+            This enables Hermes (which uses the Anthropic SDK natively) to
+            talk to MetaClaw without changing its api_mode.
+            """
+            owner: MetaClawAPIServer = request.app.state.owner
+            if owner._last_request_tracker is not None:
+                owner._last_request_tracker.touch()
+            await owner._check_auth(authorization)
+
+            body = await request.json()
+
+            # --- Translate incoming Anthropic format to OpenAI format ---
+            openai_messages = []
+            system_text = body.get("system", "")
+            if system_text:
+                if isinstance(system_text, str):
+                    openai_messages.append({"role": "system", "content": system_text})
+                elif isinstance(system_text, list):
+                    # Anthropic system can be list of content blocks
+                    texts = [b.get("text", "") for b in system_text if b.get("type") == "text"]
+                    openai_messages.append({"role": "system", "content": "\n".join(texts)})
+
+            for msg in body.get("messages", []):
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+
+                if role == "user":
+                    if isinstance(content, str):
+                        openai_messages.append({"role": "user", "content": content})
+                    elif isinstance(content, list):
+                        # Check for tool_result blocks -> convert to OpenAI tool messages
+                        tool_results = [b for b in content if b.get("type") == "tool_result"]
+                        other_blocks = [b for b in content if b.get("type") != "tool_result"]
+                        for tr in tool_results:
+                            openai_messages.append({
+                                "role": "tool",
+                                "tool_call_id": tr.get("tool_use_id", ""),
+                                "content": tr.get("content", "") if isinstance(tr.get("content"), str) else json.dumps(tr.get("content", "")),
+                            })
+                        if other_blocks:
+                            # Convert remaining content blocks
+                            texts = [b.get("text", "") for b in other_blocks if b.get("type") == "text"]
+                            if texts:
+                                openai_messages.append({"role": "user", "content": "\n".join(texts)})
+                    continue
+
+                if role == "assistant":
+                    assistant_msg: dict[str, Any] = {"role": "assistant"}
+                    if isinstance(content, str):
+                        assistant_msg["content"] = content
+                    elif isinstance(content, list):
+                        text_parts = []
+                        tool_calls_list = []
+                        reasoning = ""
+                        tc_idx = 0
+                        for block in content:
+                            btype = block.get("type", "")
+                            if btype == "text":
+                                text_parts.append(block.get("text", ""))
+                            elif btype == "thinking":
+                                reasoning += block.get("thinking", "")
+                            elif btype == "tool_use":
+                                tool_calls_list.append({
+                                    "id": block.get("id", ""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": block.get("name", ""),
+                                        "arguments": json.dumps(block.get("input", {})),
+                                    },
+                                    "index": tc_idx,
+                                })
+                                tc_idx += 1
+                        assistant_msg["content"] = "\n".join(text_parts) if text_parts else ""
+                        if reasoning:
+                            assistant_msg["reasoning_content"] = reasoning
+                        if tool_calls_list:
+                            assistant_msg["tool_calls"] = tool_calls_list
+                    openai_messages.append(assistant_msg)
+                    continue
+
+            # Build OpenAI-format body for internal processing
+            openai_body: dict[str, Any] = {
+                "messages": openai_messages,
+                "model": body.get("model", ""),
+            }
+            if body.get("max_tokens"):
+                openai_body["max_tokens"] = body["max_tokens"]
+            if body.get("temperature") is not None:
+                openai_body["temperature"] = body["temperature"]
+            if body.get("top_p") is not None:
+                openai_body["top_p"] = body["top_p"]
+            if body.get("stream"):
+                openai_body["stream"] = body["stream"]
+
+            # Convert Anthropic tools to OpenAI format
+            anthropic_tools = body.get("tools", [])
+            if anthropic_tools:
+                openai_tools = []
+                for tool in anthropic_tools:
+                    openai_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": tool.get("name", ""),
+                            "description": tool.get("description", ""),
+                            "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+                        },
+                    })
+                openai_body["tools"] = openai_tools
+
+            # Derive session/turn info (same logic as chat_completions)
+            _raw_sid = x_session_id or ""
+            if _raw_sid:
+                session_id = _raw_sid
+                turn_type = (x_turn_type or "side").strip().lower()
+            else:
+                session_id = f"anthropic-{openai_body.get('model', 'default')}"
+                turn_type = (x_turn_type or "main").strip().lower()
+            session_done = (
+                (x_session_done and x_session_done.strip().lower() in {"1", "true", "yes", "on"})
+            )
+
+            _explicit_scope = x_memory_scope or ""
+            _explicit_user = x_user_id or ""
+            _explicit_workspace = x_workspace_id or ""
+            _cached = owner._session_memory_scopes.get(session_id, "")
+            if _cached and not _explicit_scope and not _explicit_user and not _explicit_workspace:
+                memory_scope = _cached
+            else:
+                memory_scope = derive_memory_scope(
+                    default_scope=owner.memory_manager.scope_id if owner.memory_manager else "default",
+                    session_id=session_id,
+                    memory_scope=_explicit_scope,
+                    user_id=_explicit_user,
+                    workspace_id=_explicit_workspace,
+                )
+
+            # Process through MetaClaw (skill injection, memory, etc.)
+            result = await owner._handle_request(
+                openai_body,
+                session_id=session_id,
+                turn_type=turn_type,
+                session_done=session_done,
+                memory_scope=memory_scope,
+                upstream_authorization=authorization if owner.config.llm_auth_passthrough else None,
+            )
+
+            # The response from _handle_request is in OpenAI format.
+            # If upstream was Anthropic, it's already been translated back.
+            # We need to translate the final response to Anthropic format
+            # for the Hermes Anthropic SDK client.
+            openai_resp = result.get("response", result)
+            anthropic_resp = owner._openai_to_anthropic_response(openai_resp, body.get("model", ""))
+
+            stream = bool(body.get("stream", False))
+            if stream:
+                # For streaming, we'd need SSE in Anthropic format — for now, return non-streamed
+                # TODO: implement Anthropic SSE streaming format
+                pass
+
+            return JSONResponse(content=anthropic_resp)
+
         @app.post("/v1/admin/train_step")
         async def admin_train_step(request: Request):
             """Trigger a single RL training step using queued samples.
@@ -1852,6 +2029,74 @@ class MetaClawAPIServer:
                 "prompt_tokens": usage.get("input_tokens", 0),
                 "completion_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+            },
+        }
+
+    def _openai_to_anthropic_response(self, openai_resp: dict, model_id: str) -> dict:
+        """Convert OpenAI chat/completions response to Anthropic Messages API format.
+
+        Used when the incoming request was in Anthropic format (/v1/messages)
+        and we need to return an Anthropic-format response to the client.
+        """
+        choice = (openai_resp.get("choices") or [{}])[0]
+        msg = choice.get("message", {})
+
+        content_blocks = []
+
+        # Add thinking/reasoning block
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+        if reasoning:
+            content_blocks.append({
+                "type": "thinking",
+                "thinking": reasoning,
+            })
+
+        # Add text content
+        text = msg.get("content")
+        if text:
+            content_blocks.append({
+                "type": "text",
+                "text": text,
+            })
+
+        # Add tool_use blocks
+        for tc in msg.get("tool_calls", []):
+            func = tc.get("function", {})
+            args = func.get("arguments", "{}")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (json.JSONDecodeError, TypeError):
+                    args = {"raw": args}
+            content_blocks.append({
+                "type": "tool_use",
+                "id": tc.get("id", ""),
+                "name": func.get("name", ""),
+                "input": args,
+            })
+
+        # Map finish_reason to stop_reason
+        finish_reason = choice.get("finish_reason", "stop")
+        if finish_reason == "tool_calls":
+            stop_reason = "tool_use"
+        elif finish_reason == "length":
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = "end_turn"
+
+        usage = openai_resp.get("usage", {})
+
+        return {
+            "id": openai_resp.get("id", "msg_unknown").replace("chatcmpl-", "msg_"),
+            "type": "message",
+            "role": "assistant",
+            "model": model_id or openai_resp.get("model", ""),
+            "content": content_blocks if content_blocks else [{"type": "text", "text": ""}],
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
             },
         }
 
