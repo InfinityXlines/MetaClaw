@@ -222,6 +222,10 @@ class ConfigStore:
             llm_api_base=llm.get("api_base", ""),
             llm_api_key=llm.get("api_key", ""),
             llm_model_id=llm.get("model_id", ""),
+            # OAuth / Auth passthrough
+            llm_auth_passthrough=_yaml_bool(data.get("llm_auth_passthrough"), False),
+            llm_upstream_format=str(data.get("llm_upstream_format", "openai") or "openai"),
+            llm_extra_headers=str(data.get("llm_extra_headers", "") or ""),
             # Proxy
             proxy_port=proxy.get("port", 30000),
             proxy_host=proxy.get("host", "0.0.0.0"),
