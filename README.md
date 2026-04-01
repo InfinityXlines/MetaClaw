@@ -36,6 +36,61 @@
 
 ---
 
+## Fork: Multi-Provider Routing
+
+> **This is a fork of [aiming-lab/MetaClaw](https://github.com/aiming-lab/MetaClaw)** maintained at [InfinityXlines/MetaClaw](https://github.com/InfinityXlines/MetaClaw).
+> It adds a **multi-provider routing layer** so a single MetaClaw proxy can fan out to different upstream LLM APIs simultaneously.
+
+**Supported providers:**
+
+| Provider | API Format | Env Variable |
+|----------|-----------|-------------|
+| MiniMax | Anthropic messages format | `MINIMAX_API_KEY` |
+| OpenAI | OpenAI chat completions | `OPENAI_API_KEY` |
+| Anthropic | Passthrough (native) | `ANTHROPIC_API_KEY` |
+
+**Quick setup:**
+
+```bash
+# 1. Configure providers in ~/.metaclaw/config.yaml (providers section)
+# 2. Export your API keys
+export MINIMAX_API_KEY=sk-...
+export OPENAI_API_KEY=sk-...
+export ANTHROPIC_API_KEY=sk-...
+
+# 3. Start in skills-only mode (no GPU/Tinker needed)
+metaclaw start --mode skills_only
+```
+
+Requests are routed to the correct provider based on the model ID prefix. The routing layer handles format translation automatically — MiniMax receives Anthropic-format messages, OpenAI receives chat completions format, and Anthropic calls pass through unchanged.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full routing design and provider configuration reference.
+
+---
+
+## OpenClaw Integration
+
+MetaClaw sits **between OpenClaw and upstream LLM APIs** as a transparent proxy. Skills and memory injection happen automatically on every turn — no changes needed in OpenClaw itself.
+
+```jsonc
+// In openclaw.json — register metaclaw as a provider:
+{
+  "models": {
+    "providers": {
+      "metaclaw": {
+        "type": "openai-compatible",
+        "baseUrl": "http://127.0.0.1:30000/v1",
+        "apiKey": "metaclaw"
+      }
+    }
+  }
+}
+```
+
+Set your agent model to `metaclaw/MODEL-ID` (e.g. `metaclaw/moonshotai/Kimi-K2.5`). MetaClaw extracts the model ID, routes to the correct upstream provider, injects skills and memory context into the prompt, and returns the response. From OpenClaw's perspective it looks like a normal LLM call.
+
+---
+
 <div align="center">
 
 ### Two commands. That's it.
