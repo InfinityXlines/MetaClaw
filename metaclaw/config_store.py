@@ -175,6 +175,8 @@ class ConfigStore:
     # ------------------------------------------------------------------ #
 
     def to_metaclaw_config(self) -> MetaClawConfig:
+        import json as _json
+
         data = self.load()
         llm = data.get("llm", {})
         proxy = data.get("proxy", {})
@@ -185,6 +187,10 @@ class ConfigStore:
         sched_cal = sched.get("calendar", {})
         wx = data.get("wechat", {})
         mode = data.get("mode", "auto")
+
+        # Multi-provider routing: serialize the providers dict to JSON string
+        providers_raw = data.get("providers", {})
+        providers_json = _json.dumps(providers_raw) if providers_raw else ""
         rl_enabled = mode in ("rl", "auto") or bool(rl.get("enabled", False))
 
         # Evolver: prefer rl.evolver_*, fallback to llm.*
@@ -218,6 +224,8 @@ class ConfigStore:
         return MetaClawConfig(
             # Mode
             mode=mode,
+            # Multi-provider routing
+            providers=providers_json,
             # LLM for skills_only forwarding
             llm_api_base=llm.get("api_base", ""),
             llm_api_key=llm.get("api_key", ""),

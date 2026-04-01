@@ -1133,6 +1133,12 @@ class MetaClawAPIServer:
         return app
 
     async def _check_auth(self, authorization: Optional[str], x_api_key: Optional[str] = None):
+        # Multi-provider mode: when providers are configured with their own keys,
+        # allow requests without client auth — MetaClaw authenticates upstream itself.
+        if self.config.providers:
+            # Multi-provider: client auth is optional (nice to have for passthrough
+            # providers like Anthropic, but not required for providers with own keys)
+            return
         # In passthrough mode, skip local validation — let upstream validate.
         # Accept either Authorization: Bearer or x-api-key (Anthropic-style).
         if self.config.llm_auth_passthrough:
@@ -1748,6 +1754,58 @@ class MetaClawAPIServer:
             raise HTTPException(status_code=502, detail=f"Tinker inference error: {e}") from e
 
     # ------------------------------------------------------------------ #
+    # Multi-provider routing                                               #
+    # ------------------------------------------------------------------ #
+
+    def _resolve_provider(self, model_id: str) -> dict:
+        """Resolve which upstream provider to use for the given model ID.
+
+        Checks the multi-provider config (from config.yaml's ``providers:``
+        section) for a model match, then falls back to legacy single-upstream
+        ``llm_*`` fields.
+
+        Returns a dict with keys:
+            api_base, api_key, format, extra_headers, auth_mode
+        """
+        # Try multi-provider routing first
+        if self.config.providers:
+            try:
+                providers = json.loads(self.config.providers)
+                if isinstance(providers, dict):
+                    for provider_name, pconf in providers.items():
+                        models = pconf.get("models", [])
+                        if model_id in models:
+                            api_key = pconf.get("api_key", "")
+                            # Resolve env var references like ${MINIMAX_API_KEY}
+                            if api_key.startswith("${") and api_key.endswith("}"):
+                                env_var = api_key[2:-1]
+                                api_key = os.environ.get(env_var, "")
+                            logger.info(
+                                "[MetaClaw] Provider routing: model=%s -> provider=%s (base=%s, format=%s, auth=%s)",
+                                model_id, provider_name, pconf.get("api_base", ""),
+                                pconf.get("format", "openai"), pconf.get("auth_mode", "bearer"),
+                            )
+                            return {
+                                "api_base": pconf.get("api_base", ""),
+                                "api_key": api_key,
+                                "format": pconf.get("format", "openai"),
+                                "extra_headers": pconf.get("extra_headers", ""),
+                                "auth_mode": pconf.get("auth_mode", "bearer"),
+                            }
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("[MetaClaw] Failed to parse providers config: %s", self.config.providers[:200])
+
+        # Fallback to legacy single-upstream config
+        auth_mode = "passthrough" if self.config.llm_auth_passthrough else "bearer"
+        return {
+            "api_base": self.config.llm_api_base,
+            "api_key": self.config.llm_api_key,
+            "format": self.config.llm_upstream_format or "openai",
+            "extra_headers": self.config.llm_extra_headers,
+            "auth_mode": auth_mode,
+        }
+
+    # ------------------------------------------------------------------ #
     # LLM forwarding (skills_only mode)                                   #
     # ------------------------------------------------------------------ #
 
@@ -1755,39 +1813,55 @@ class MetaClawAPIServer:
         """Forward to a real LLM API (skills_only mode).
 
         Supports both OpenAI-compatible (/v1/chat/completions) and
-        Anthropic-native (/v1/messages) upstream formats.  When
-        ``config.llm_auth_passthrough`` is True, the incoming Authorization
-        or x-api-key header is forwarded to upstream instead of using ``llm_api_key``.
+        Anthropic-native (/v1/messages) upstream formats.  Uses multi-provider
+        routing when configured, falling back to legacy ``llm_*`` fields.
+        Auth modes: "passthrough" forwards client auth, "x-api-key" sends
+        x-api-key header, "bearer" sends Authorization: Bearer header.
         """
         import httpx
 
-        api_base = self.config.llm_api_base.rstrip("/")
+        # Resolve provider based on model ID in the request body
+        model_id = body.get("model", "") or self.config.llm_model_id or ""
+        provider = self._resolve_provider(model_id)
+
+        api_base = (provider["api_base"] or "").rstrip("/")
         if not api_base:
             raise HTTPException(
                 status_code=503,
-                detail="llm_api_base is not configured. Run 'metaclaw setup' first.",
+                detail="No API base configured for model '{}'. Check providers config or llm_api_base.".format(model_id),
             )
 
-        # --- Build auth header ---
+        # --- Build auth header based on provider auth_mode ---
         headers: dict[str, str] = {}
-        if self.config.llm_auth_passthrough:
+        auth_mode = (provider.get("auth_mode") or "bearer").strip().lower()
+
+        if auth_mode == "passthrough":
+            # Forward whatever auth the client sent
             if upstream_authorization:
-                # Pass through the client's Bearer token (OAuth from Hermes/Claude CLI)
                 headers["Authorization"] = upstream_authorization
             if upstream_x_api_key:
-                # Pass through Anthropic-style x-api-key (from OpenClaw)
                 headers["x-api-key"] = upstream_x_api_key
-        elif self.config.llm_api_key:
-            headers["Authorization"] = f"Bearer {self.config.llm_api_key}"
+        elif auth_mode == "x-api-key":
+            # Send configured key as x-api-key header (e.g. MiniMax)
+            if provider["api_key"]:
+                headers["x-api-key"] = provider["api_key"]
+            # Also forward client auth if present (some providers accept both)
+            if upstream_authorization:
+                headers["Authorization"] = upstream_authorization
+        elif auth_mode == "bearer":
+            # Send configured key as Bearer token
+            if provider["api_key"]:
+                headers["Authorization"] = "Bearer {}".format(provider["api_key"])
 
         # Merge any extra headers (e.g. Anthropic beta headers)
-        if self.config.llm_extra_headers:
+        extra_headers_str = provider.get("extra_headers", "")
+        if extra_headers_str:
             try:
-                extra = json.loads(self.config.llm_extra_headers)
+                extra = json.loads(extra_headers_str)
                 if isinstance(extra, dict):
                     headers.update(extra)
             except (json.JSONDecodeError, TypeError):
-                logger.warning("[MetaClaw] Failed to parse llm_extra_headers: %s", self.config.llm_extra_headers)
+                logger.warning("[MetaClaw] Failed to parse extra_headers: %s", extra_headers_str)
 
         # OpenRouter requires HTTP-Referer and X-Title for free-tier model access
         if "openrouter.ai" in api_base:
@@ -1795,7 +1869,7 @@ class MetaClawAPIServer:
             headers.setdefault("X-Title", "MetaClaw")
 
         # --- Route to appropriate upstream format ---
-        upstream_format = (self.config.llm_upstream_format or "openai").strip().lower()
+        upstream_format = (provider.get("format") or "openai").strip().lower()
 
         if upstream_format == "anthropic":
             return await self._forward_to_anthropic(body, api_base, headers)

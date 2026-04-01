@@ -174,6 +174,14 @@ class MetaClawConfig:
     llm_extra_headers: str = ""  # e.g. '{"anthropic-beta": "...", "x-app": "cli"}'
 
     # ------------------------------------------------------------------ #
+    # Multi-provider routing (overrides single llm_* fields per model)   #
+    # ------------------------------------------------------------------ #
+    # JSON string of provider configs, or empty to use legacy llm_* fields.
+    # Populated at runtime by api_server from config.yaml's `providers:` section.
+    # Each provider: {api_base, api_key, format, extra_headers, auth_mode, models}
+    providers: str = ""
+
+    # ------------------------------------------------------------------ #
     # LLM for skill evolution                                             #
     # ------------------------------------------------------------------ #
     # Provider: "openai" | "bedrock"
