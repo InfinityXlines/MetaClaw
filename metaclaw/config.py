@@ -155,6 +155,25 @@ class MetaClawConfig:
     llm_model_id: str = ""      # model name to forward to
 
     # ------------------------------------------------------------------ #
+    # OAuth / Auth passthrough (for Hermes integration)                  #
+    # ------------------------------------------------------------------ #
+    # When True, the incoming Authorization header from the client is
+    # forwarded to the upstream LLM API instead of using llm_api_key.
+    # This enables OAuth token passthrough — the agent framework (Hermes)
+    # manages token lifecycle, MetaClaw just passes it through.
+    llm_auth_passthrough: bool = False
+
+    # Upstream API format: "openai" (default /v1/chat/completions) or
+    # "anthropic" (native /v1/messages).  When "anthropic", MetaClaw
+    # translates its internal OpenAI format to Anthropic Messages API
+    # before forwarding, and includes required Anthropic headers.
+    llm_upstream_format: str = "openai"  # "openai" | "anthropic"
+
+    # Extra headers to include on upstream LLM requests (JSON dict string
+    # or empty).  Useful for Anthropic beta headers, user-agent overrides, etc.
+    llm_extra_headers: str = ""  # e.g. '{"anthropic-beta": "...", "x-app": "cli"}'
+
+    # ------------------------------------------------------------------ #
     # LLM for skill evolution                                             #
     # ------------------------------------------------------------------ #
     # Provider: "openai" | "bedrock"

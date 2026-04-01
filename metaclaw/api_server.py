@@ -687,6 +687,7 @@ class MetaClawAPIServer:
                 turn_type=turn_type,
                 session_done=session_done,
                 memory_scope=memory_scope,
+                upstream_authorization=authorization if owner.config.llm_auth_passthrough else None,
             )
             if stream:
                 return StreamingResponse(
@@ -950,6 +951,12 @@ class MetaClawAPIServer:
         return app
 
     async def _check_auth(self, authorization: Optional[str]):
+        # In passthrough mode, skip local validation — let upstream validate.
+        # We still require *some* token so the proxy isn't wide-open.
+        if self.config.llm_auth_passthrough:
+            if not authorization or not authorization.startswith("Bearer "):
+                raise HTTPException(status_code=401, detail="missing bearer token")
+            return
         if not self._expected_api_key:
             return
         if not authorization or not authorization.startswith("Bearer "):
@@ -1144,6 +1151,7 @@ class MetaClawAPIServer:
         turn_type: str,
         session_done: bool,
         memory_scope: str = "",
+        upstream_authorization: Optional[str] = None,
     ) -> dict[str, Any]:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -1235,7 +1243,7 @@ class MetaClawAPIServer:
         forward_body["messages"] = _ensure_reasoning_content(messages)
 
         if self.config.mode == "skills_only":
-            output = await self._forward_to_llm(forward_body)
+            output = await self._forward_to_llm(forward_body, upstream_authorization=upstream_authorization)
         else:
             output = await self._forward_to_tinker(forward_body)
 
@@ -1556,8 +1564,14 @@ class MetaClawAPIServer:
     # LLM forwarding (skills_only mode)                                   #
     # ------------------------------------------------------------------ #
 
-    async def _forward_to_llm(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Forward to a real OpenAI-compatible API (skills_only mode)."""
+    async def _forward_to_llm(self, body: dict[str, Any], upstream_authorization: Optional[str] = None) -> dict[str, Any]:
+        """Forward to a real LLM API (skills_only mode).
+
+        Supports both OpenAI-compatible (/v1/chat/completions) and
+        Anthropic-native (/v1/messages) upstream formats.  When
+        ``config.llm_auth_passthrough`` is True, the incoming Authorization
+        header is forwarded to upstream instead of using ``llm_api_key``.
+        """
         import httpx
 
         api_base = self.config.llm_api_base.rstrip("/")
@@ -1567,6 +1581,40 @@ class MetaClawAPIServer:
                 detail="llm_api_base is not configured. Run 'metaclaw setup' first.",
             )
 
+        # --- Build auth header ---
+        headers: dict[str, str] = {}
+        if self.config.llm_auth_passthrough and upstream_authorization:
+            # Pass through the client's auth (OAuth token from Hermes)
+            headers["Authorization"] = upstream_authorization
+        elif self.config.llm_api_key:
+            headers["Authorization"] = f"Bearer {self.config.llm_api_key}"
+
+        # Merge any extra headers (e.g. Anthropic beta headers)
+        if self.config.llm_extra_headers:
+            try:
+                extra = json.loads(self.config.llm_extra_headers)
+                if isinstance(extra, dict):
+                    headers.update(extra)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("[MetaClaw] Failed to parse llm_extra_headers: %s", self.config.llm_extra_headers)
+
+        # OpenRouter requires HTTP-Referer and X-Title for free-tier model access
+        if "openrouter.ai" in api_base:
+            headers.setdefault("HTTP-Referer", "https://github.com/aiming-lab/MetaClaw")
+            headers.setdefault("X-Title", "MetaClaw")
+
+        # --- Route to appropriate upstream format ---
+        upstream_format = (self.config.llm_upstream_format or "openai").strip().lower()
+
+        if upstream_format == "anthropic":
+            return await self._forward_to_anthropic(body, api_base, headers)
+        else:
+            return await self._forward_to_openai(body, api_base, headers)
+
+    async def _forward_to_openai(self, body: dict[str, Any], api_base: str, headers: dict[str, str]) -> dict[str, Any]:
+        """Forward to an OpenAI-compatible /v1/chat/completions endpoint."""
+        import httpx
+
         # Strip Tinker-specific fields not supported by standard OpenAI APIs
         send_body = {
             k: v for k, v in body.items()
@@ -1574,14 +1622,6 @@ class MetaClawAPIServer:
         }
         send_body["model"] = self.config.llm_model_id or body.get("model", "")
         send_body["stream"] = False
-
-        headers: dict[str, str] = {}
-        if self.config.llm_api_key:
-            headers["Authorization"] = f"Bearer {self.config.llm_api_key}"
-        # OpenRouter requires HTTP-Referer and X-Title for free-tier model access
-        if "openrouter.ai" in api_base:
-            headers.setdefault("HTTP-Referer", "https://github.com/aiming-lab/MetaClaw")
-            headers.setdefault("X-Title", "MetaClaw")
 
         try:
             async with httpx.AsyncClient(timeout=600.0) as client:
@@ -1615,12 +1655,205 @@ class MetaClawAPIServer:
 
             return result
         except httpx.HTTPStatusError as e:
-            logger.error("[OpenClaw] upstream LLM error: %s %s", e.response.status_code, e.response.text[:200])
-            logger.debug("[send_body] upstream HTTP error, status=%s", e.response.status_code if hasattr(e, 'response') else 'unknown')
+            logger.error("[MetaClaw] upstream OpenAI error: %s %s", e.response.status_code, e.response.text[:200])
             raise HTTPException(status_code=502, detail=f"Upstream LLM error: {e}") from e
         except Exception as e:
-            logger.error("[OpenClaw] LLM forward failed: %s", e, exc_info=True)
+            logger.error("[MetaClaw] OpenAI forward failed: %s", e, exc_info=True)
             raise HTTPException(status_code=502, detail=f"LLM forward error: {e}") from e
+
+    async def _forward_to_anthropic(self, body: dict[str, Any], api_base: str, headers: dict[str, str]) -> dict[str, Any]:
+        """Forward to the native Anthropic Messages API (/v1/messages).
+
+        Translates the internal OpenAI-format messages to Anthropic format,
+        sends to the upstream Anthropic API, then translates the response
+        back to OpenAI format for MetaClaw's internal processing.
+        """
+        import httpx
+
+        messages = body.get("messages", [])
+        model_id = self.config.llm_model_id or body.get("model", "")
+
+        # --- Translate OpenAI messages to Anthropic format ---
+        system_text = ""
+        anthropic_messages = []
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "system":
+                # Anthropic uses a top-level system param, not a system message
+                if isinstance(content, str):
+                    system_text = (system_text + "\n\n" + content).strip() if system_text else content
+                elif isinstance(content, list):
+                    # Handle content blocks
+                    texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+                    text = "\n".join(texts)
+                    system_text = (system_text + "\n\n" + text).strip() if system_text else text
+                continue
+
+            if role == "tool":
+                # Convert OpenAI tool result to Anthropic tool_result
+                anthropic_messages.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": msg.get("tool_call_id", ""),
+                        "content": content if isinstance(content, str) else json.dumps(content),
+                    }],
+                })
+                continue
+
+            if role == "assistant":
+                content_blocks = []
+                # Handle thinking/reasoning
+                reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+                if reasoning:
+                    content_blocks.append({
+                        "type": "thinking",
+                        "thinking": reasoning,
+                    })
+                # Handle text content
+                if isinstance(content, str) and content:
+                    content_blocks.append({"type": "text", "text": content})
+                elif isinstance(content, list):
+                    content_blocks.extend(content)
+                # Handle tool_calls -> tool_use
+                for tc in msg.get("tool_calls", []):
+                    func = tc.get("function", {})
+                    args = func.get("arguments", "{}")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (json.JSONDecodeError, TypeError):
+                            args = {"raw": args}
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": func.get("name", ""),
+                        "input": args,
+                    })
+                anthropic_messages.append({
+                    "role": "assistant",
+                    "content": content_blocks if content_blocks else [{"type": "text", "text": ""}],
+                })
+                continue
+
+            # user message
+            if isinstance(content, str):
+                anthropic_messages.append({"role": "user", "content": content})
+            else:
+                anthropic_messages.append({"role": "user", "content": content})
+
+        # --- Build Anthropic request ---
+        anthropic_body: dict[str, Any] = {
+            "model": model_id,
+            "messages": anthropic_messages,
+            "max_tokens": body.get("max_tokens") or 16384,
+        }
+        if system_text:
+            anthropic_body["system"] = system_text
+        if body.get("temperature") is not None:
+            anthropic_body["temperature"] = body["temperature"]
+        if body.get("top_p") is not None:
+            anthropic_body["top_p"] = body["top_p"]
+
+        # Convert OpenAI tools to Anthropic tool format
+        openai_tools = body.get("tools", [])
+        if openai_tools:
+            anthropic_tools = []
+            for tool in openai_tools:
+                if tool.get("type") == "function":
+                    func = tool.get("function", {})
+                    anthropic_tools.append({
+                        "name": func.get("name", ""),
+                        "description": func.get("description", ""),
+                        "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
+                    })
+            if anthropic_tools:
+                anthropic_body["tools"] = anthropic_tools
+
+        # Required Anthropic headers
+        headers.setdefault("content-type", "application/json")
+        headers.setdefault("anthropic-version", "2023-06-01")
+
+        try:
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                resp = await client.post(
+                    f"{api_base}/v1/messages",
+                    json=anthropic_body,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                anthropic_result = resp.json()
+
+            # --- Translate Anthropic response back to OpenAI format ---
+            return self._anthropic_to_openai_response(anthropic_result, model_id)
+
+        except httpx.HTTPStatusError as e:
+            logger.error("[MetaClaw] upstream Anthropic error: %s %s", e.response.status_code, e.response.text[:500])
+            raise HTTPException(status_code=502, detail=f"Upstream Anthropic error: {e}") from e
+        except Exception as e:
+            logger.error("[MetaClaw] Anthropic forward failed: %s", e, exc_info=True)
+            raise HTTPException(status_code=502, detail=f"Anthropic forward error: {e}") from e
+
+    def _anthropic_to_openai_response(self, anthropic_resp: dict, model_id: str) -> dict:
+        """Convert Anthropic Messages API response to OpenAI chat/completions format."""
+        content_blocks = anthropic_resp.get("content", [])
+
+        text_parts = []
+        tool_calls = []
+        reasoning_content = ""
+        tc_index = 0
+
+        for block in content_blocks:
+            btype = block.get("type", "")
+            if btype == "text":
+                text_parts.append(block.get("text", ""))
+            elif btype == "thinking":
+                reasoning_content += block.get("thinking", "")
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "id": block.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name", ""),
+                        "arguments": json.dumps(block.get("input", {})),
+                    },
+                    "index": tc_index,
+                })
+                tc_index += 1
+
+        assistant_msg: dict[str, Any] = {
+            "role": "assistant",
+            "content": "\n".join(text_parts) if text_parts else None,
+        }
+        if reasoning_content:
+            assistant_msg["reasoning_content"] = reasoning_content
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+
+        stop_reason = anthropic_resp.get("stop_reason", "end_turn")
+        finish_reason = "tool_calls" if stop_reason == "tool_use" else "stop"
+
+        usage = anthropic_resp.get("usage", {})
+
+        return {
+            "id": f"chatcmpl-{anthropic_resp.get('id', 'unknown')}",
+            "object": "chat.completion",
+            "created": int(__import__("time").time()),
+            "model": model_id,
+            "choices": [{
+                "index": 0,
+                "message": assistant_msg,
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": usage.get("input_tokens", 0),
+                "completion_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+            },
+        }
 
     # ------------------------------------------------------------------ #
     # Skill evolution (skills_only mode)                                  #
